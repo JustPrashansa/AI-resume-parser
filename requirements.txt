@@ -1,0 +1,7 @@
+streamlit
+groq
+pandas
+openpyxl
+pdfplumber
+python-docx
+python-dotenv

@@ -1,0 +1,6 @@
+.env
+symbolic-axe-*.json
+temp_resumes/
+__pycache__/
+*.pyc
+candidates.xlsx
