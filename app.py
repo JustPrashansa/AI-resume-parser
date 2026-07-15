@@ -10,7 +10,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from drive_utils import (
     get_files_from_folder,
-    download_file
+    download_file,
+    download_cache_from_drive,
+    upload_cache_to_drive,
+    get_drive_service
 )
 
 from extractor import (
@@ -26,52 +29,87 @@ st.set_page_config(
 
 st.title("Teacher Resume Parser")
 
+
+def get_secret(name, default=None):
+    """
+    Works both locally (.env via os.environ, loaded by extractor.py's
+    load_dotenv()) and on Streamlit Community Cloud (st.secrets, set in
+    the app's Settings -> Secrets). Streamlit secrets take priority so a
+    deployed app doesn't need a .env file at all.
+    """
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+DRIVE_CACHE_FOLDER_ID = get_secret("DRIVE_CACHE_FOLDER_ID")
+
+if not OPENAI_API_KEY:
+    st.error(
+        "OPENAI_API_KEY is not set. Add it to your .env file locally, or "
+        "to this app's Secrets if it's deployed on Streamlit Cloud."
+    )
+    st.stop()
+os.environ.setdefault("OPENAI_API_KEY", OPENAI_API_KEY)
+
+if not DRIVE_CACHE_FOLDER_ID:
+    st.warning(
+        "DRIVE_CACHE_FOLDER_ID is not set — caches will only be saved "
+        "locally on this machine for this session, not persisted to "
+        "Google Drive. Set DRIVE_CACHE_FOLDER_ID to a Drive folder ID "
+        "(shared with your service account) to persist across machines."
+    )
+
 drive_link = st.text_input(
     "Paste Google Drive Folder Link"
 )
 
-# Switched to llama-3.3-70b-versatile for much better extraction accuracy
-# (see extractor.py). It's slower and Groq's free tier RPM limit is lower
-# for 70b models than for the 8b-instant model, so concurrency is reduced
-# here to avoid constant 429 retries. Bump this up if you're on a paid tier.
-GROQ_WORKERS = 2
+OPENAI_WORKERS = int(get_secret("OPENAI_WORKERS", 5))
 DOWNLOAD_WORKERS = 5
 
-# Cache #1: already-processed Drive file IDs -> result.
-# Lets us skip download + Groq entirely for files we've seen before
-# (same file, re-scanned on a later run).
 CACHE_FILE = "processed_cache.json"
-
-# Cache #2: content hash -> result.
-# Catches TRUE duplicates — e.g. same CV re-uploaded as a new file with
-# a new Drive ID (or a different filename). We hash the extracted resume
-# text (free, local step) and skip the Groq call if we've seen that exact
-# content before, reusing the old parsed result instead.
 CONTENT_CACHE_FILE = "content_hash_cache.json"
 
-# Content cache is read/written from multiple threads during parallel
-# processing, so it needs a lock to stay safe.
 content_cache_lock = threading.Lock()
+def load_json_cache(file_name):
 
+    if DRIVE_CACHE_FOLDER_ID:
+        try:
+            text = download_cache_from_drive(DRIVE_CACHE_FOLDER_ID, file_name)
+            if text:
+                return json.loads(text)
+            return {}
+        except Exception as e:
+            st.warning(f"Could not load {file_name} from Drive ({e}). Starting fresh.")
+            return {}
 
-def load_json_cache(path):
-
-    if not os.path.exists(path):
+    if not os.path.exists(file_name):
         return {}
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(file_name, "r", encoding="utf-8") as f:
             return json.load(f)
-
     except Exception:
-        # Corrupted cache shouldn't block the whole run — start fresh.
         return {}
 
 
-def save_json_cache(path, data):
+def save_json_cache(file_name, data):
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+
+    if DRIVE_CACHE_FOLDER_ID:
+        try:
+            upload_cache_to_drive(DRIVE_CACHE_FOLDER_ID, file_name, text)
+            return
+        except Exception as e:
+            st.error(f"Could not save {file_name} to Drive ({e}). Saving locally instead.")
+
+    with open(file_name, "w", encoding="utf-8") as f:
+        f.write(text)
 
 
 def load_cache():
@@ -83,8 +121,6 @@ def save_cache(cache):
 
 
 def hash_text(text):
-    # Normalize whitespace so trivial formatting differences (extra
-    # spaces/newlines from re-saving a PDF) don't cause a false "new" hit.
     normalized = " ".join(text.split()).lower()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
@@ -96,56 +132,35 @@ def process_resume(file_info, output_dir, content_cache):
 
     try:
 
-        file_path = os.path.join(
-            output_dir,
-            file_name
-        )
+        file_path = os.path.join(output_dir, file_name)
 
         if file_name.lower().endswith(".pdf"):
-
             text = read_pdf(file_path)
-
         elif file_name.lower().endswith(".docx"):
-
             text = read_docx(file_path)
-
         else:
-
             return None
 
         content_hash = hash_text(text)
 
-        # Check if we've already sent this EXACT content to Groq before
-        # (e.g. same CV re-uploaded under a different file name/ID).
-        # If so, reuse that result instead of paying for another API call.
         with content_cache_lock:
             cached_result = content_cache.get(content_hash)
 
         if cached_result is not None:
 
-            data = dict(cached_result)  # copy, don't mutate the cached one
-            data["resume_link"] = (
-                f"https://drive.google.com/file/d/{file_id}/view"
-            )
+            data = dict(cached_result)
+            data["resume_link"] = f"https://drive.google.com/file/d/{file_id}/view"
             data["resume_file_name"] = file_name
             data["duplicate_of_content"] = True
 
             return data
 
-        # New content — actually call Groq.
         data = extract_resume_data(text)
 
-        data["resume_link"] = (
-            f"https://drive.google.com/file/d/{file_id}/view"
-        )
-
+        data["resume_link"] = f"https://drive.google.com/file/d/{file_id}/view"
         data["resume_file_name"] = file_name
         data["duplicate_of_content"] = False
 
-        # Only cache genuinely successful extractions. If Groq failed for
-        # this resume, caching it would make it look "done" forever and
-        # the "rerun later to retry" message would be a lie — a future
-        # run needs to actually retry it, not skip it as already-known.
         if not data.get("extraction_failed"):
             with content_cache_lock:
                 content_cache[content_hash] = data
@@ -154,57 +169,38 @@ def process_resume(file_info, output_dir, content_cache):
 
     except Exception as e:
 
-        return {
-            "error": f"{file_name}: {str(e)}"
-        }
+        return {"error": f"{file_name}: {str(e)}"}
 
 
 if st.button("Process Resumes"):
 
     if not drive_link:
-
-        st.error(
-            "Please enter a Google Drive folder link."
-        )
-
+        st.error("Please enter a Google Drive folder link.")
         st.stop()
 
     output_dir = "temp_resumes"
 
     if os.path.exists(output_dir):
-
         shutil.rmtree(output_dir)
 
     os.makedirs(output_dir)
 
-    st.write(
-        "Fetching files from Google Drive..."
-    )
+    st.write("Fetching files from Google Drive...")
 
-    files, skipped_files = get_files_from_folder(
-        drive_link
-    )
+    files, skipped_files = get_files_from_folder(drive_link)
 
     if skipped_files:
-
         skipped_names = ", ".join(f["name"] for f in skipped_files)
-
         st.warning(
             f"Skipped {len(skipped_files)} native Google Docs/Sheets/Slides "
             f"(not downloadable as-is): {skipped_names}"
         )
 
     if not files:
-
-        st.error(
-            "No downloadable files found."
-        )
-
+        st.error("No downloadable files found.")
         st.stop()
 
-    st.write(
-        f"Found {len(files)} files"
-    )
+    st.write(f"Found {len(files)} files")
 
     cache = load_cache()
     content_cache = load_json_cache(CONTENT_CACHE_FILE)
@@ -218,16 +214,9 @@ if st.button("Process Resumes"):
     )
 
     if not new_files:
-
         st.success("Nothing new to process. Using cached results only.")
 
     files = new_files
-
-    # PIPELINE: download and process concurrently. As soon as a file
-    # finishes downloading, it's submitted for Groq processing right away
-    # — we don't wait for all 25 downloads to finish before processing
-    # starts. This is the main speed win, since the Groq call is the
-    # slowest step and was previously sitting idle during downloads.
 
     download_progress = st.progress(0)
     process_progress = st.progress(0)
@@ -241,14 +230,11 @@ if st.button("Process Resumes"):
     processed_count = 0
 
     download_executor = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS)
-    groq_executor = ThreadPoolExecutor(max_workers=GROQ_WORKERS)
+    groq_executor = ThreadPoolExecutor(max_workers=OPENAI_WORKERS)
 
     download_futures = {
         download_executor.submit(
-            download_file,
-            f["id"],
-            f["name"],
-            output_dir
+            download_file, f["id"], f["name"], output_dir
         ): f
         for f in files
     } if files else {}
@@ -265,21 +251,13 @@ if st.button("Process Resumes"):
         try:
             future.result()
 
-            # File is on disk now — kick off processing immediately,
-            # don't wait for other downloads.
             process_future = groq_executor.submit(
-                process_resume,
-                file_info,
-                output_dir,
-                content_cache
+                process_resume, file_info, output_dir, content_cache
             )
             process_futures[process_future] = file_info
 
         except Exception as e:
-            download_failures.append({
-                "name": file_info["name"],
-                "error": str(e)
-            })
+            download_failures.append({"name": file_info["name"], "error": str(e)})
             st.error(f"Download failed: {file_info['name']} ({str(e)})")
 
     for future in as_completed(process_futures):
@@ -297,11 +275,6 @@ if st.button("Process Resumes"):
             else:
                 results.append(result)
 
-                # Save into the cache keyed by Drive file ID, so tomorrow's
-                # run knows this one's already done and skips it — UNLESS
-                # extraction failed, in which case we deliberately do NOT
-                # cache it, so a future run actually retries it instead of
-                # treating a failed/blank result as permanently "done".
                 if not result.get("extraction_failed"):
                     cache[file_info["id"]] = result
 
@@ -311,17 +284,13 @@ if st.button("Process Resumes"):
     save_cache(cache)
     save_json_cache(CONTENT_CACHE_FILE, content_cache)
 
-    duplicate_content_count = sum(
-        1 for r in results if r.get("duplicate_of_content")
-    )
+    duplicate_content_count = sum(1 for r in results if r.get("duplicate_of_content"))
 
-    failed_extraction = [
-        r for r in results if r.get("extraction_failed")
-    ]
+    failed_extraction = [r for r in results if r.get("extraction_failed")]
 
     st.write(
         f"Done. {len(results)} new files handled "
-        f"({duplicate_content_count} were duplicate content — skipped Groq, reused cached result). "
+        f"({duplicate_content_count} were duplicate content — skipped the model call, reused cached result). "
         f"{len(cache)} total candidates in cache."
     )
 
@@ -332,33 +301,26 @@ if st.button("Process Resumes"):
         )
 
         st.error(
-            f"⚠️ {len(failed_extraction)} resumes could not be extracted by Groq "
-            f"(rate-limited or errored after all retries — only email/phone were "
-            f"regex-extracted for these, everything else is blank). "
+            f"⚠️ {len(failed_extraction)} resumes could not be extracted "
+            f"(errored after all retries — only email/phone were regex-extracted "
+            f"for these, everything else is blank). "
             f"Re-run later to retry them: {failed_names}"
         )
-
-    # BUILD DATAFRAME from the FULL cache (old + new), not just today's
-    # new results — this is what makes the Excel always contain
-    # everyone ever processed, without re-calling Groq on repeats.
 
     all_results = list(cache.values())
 
     if all_results:
 
-        df = pd.DataFrame(
-            all_results
-        )
+        df = pd.DataFrame(all_results)
 
         list_columns = [
-
             "subjects",
             "grade_levels",
             "languages",
             "extra_qualifications",
             "college",
-            "education_history"
-
+            "education_history",
+            "previous_institutions",
         ]
 
         for col in list_columns:
@@ -366,61 +328,29 @@ if st.button("Process Resumes"):
             if col in df.columns:
 
                 df[col] = df[col].apply(
-
                     lambda x:
-
                     "; ".join(
-
                         item if isinstance(item, str)
                         else json.dumps(item) if isinstance(item, dict)
                         else str(item)
-
                         for item in x
                     )
-
-                    if isinstance(
-                        x,
-                        list
-                    )
-
+                    if isinstance(x, list)
                     else x
-
                 )
 
-        # 'age' (and a few other fields) can come back as int, string, or
-        # None depending on what the LLM returns per resume. Mixed types
-        # in one column break PyArrow's dataframe rendering in Streamlit.
-        # Force these to plain strings so the column type is consistent.
         for col in ["age", "experience_years"]:
 
             if col in df.columns:
-
-                df[col] = df[col].apply(
-                    lambda x: str(x) if x is not None else None
-                )
-
-        # REMOVE DUPLICATES
+                df[col] = pd.array(df[col], dtype="Int64")
 
         if "email" in df.columns:
-
-            df = df.drop_duplicates(
-
-                subset=["email"],
-                keep="first"
-
-            )
+            df = df.drop_duplicates(subset=["email"], keep="first")
 
         if "phone" in df.columns:
-
-            df = df.drop_duplicates(
-
-                subset=["phone"],
-                keep="first"
-
-            )
+            df = df.drop_duplicates(subset=["phone"], keep="first")
 
         desired_order = [
-
             "full_name",
             "email",
             "phone",
@@ -443,75 +373,33 @@ if st.button("Process Resumes"):
 
             "current_institution",
             "current_designation",
+            "previous_institutions",
 
             "preferred_job_type",
 
             "resume_link"
-
         ]
 
-        existing_columns = [
+        existing_columns = [col for col in desired_order if col in df.columns]
 
-            col
+        df = df[existing_columns]
 
-            for col in desired_order
+        excel_file = "candidates.xlsx"
 
-            if col in df.columns
+        df.to_excel(excel_file, index=False)
 
-        ]
+        st.success(f"Processed {len(df)} unique candidates")
 
-        df = df[
-            existing_columns
-        ]
+        st.dataframe(df, width="stretch")
 
-        excel_file = (
-            "candidates.xlsx"
-        )
-
-        df.to_excel(
-
-            excel_file,
-
-            index=False
-
-        )
-
-        st.success(
-
-            f"Processed {len(df)} unique candidates"
-
-        )
-
-        st.dataframe(
-
-            df,
-
-            width="stretch"
-
-        )
-
-        with open(
-
-            excel_file,
-
-            "rb"
-
-        ) as f:
+        with open(excel_file, "rb") as f:
 
             st.download_button(
-
                 label="Download Excel",
-
                 data=f,
-
                 file_name="candidates.xlsx",
-
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-
             )
 
     else:
-
-        st.warning(
-            "No candidate data extracted."
-        )
+        st.warning("No candidate data extracted.")

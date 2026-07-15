@@ -1,6 +1,11 @@
 .env
-symbolic-axe-*.json
-temp_resumes/
+*.json
 __pycache__/
 *.pyc
+temp_resumes/
 candidates.xlsx
+processed_cache.json
+content_hash_cache.json
+.vscode/
+.DS_Store
+Thumbs.db

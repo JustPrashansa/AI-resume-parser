@@ -4,27 +4,16 @@ import time
 import random
 import pdfplumber
 from docx import Document
-from groq import Groq
+from openai import OpenAI
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
 
-client = Groq(
-    api_key=os.getenv("GROQ_API_KEY")
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY")
 )
-
-# llama-3.1-8b-instant is fast but genuinely inaccurate for structured
-# extraction — it confuses dates of birth with age, and returns wildly
-# inconsistent JSON shapes (education_history as strings one time, nested
-# dicts the next). llama-3.3-70b-versatile is much more reliable at
-# following the schema, BUT Groq's free tier gives it a much stricter
-# rate limit than the 8B model. If 70B keeps hitting 429s and exhausts
-# retries, we fall back to 8B rather than silently returning nothing —
-# a slightly-less-accurate result beats a blank row.
-GROQ_MODEL_PRIMARY = "llama-3.3-70b-versatile"
-GROQ_MODEL_FALLBACK = "llama-3.1-8b-instant"
-
+OPENAI_MODEL = "gpt-4.1-mini"
 
 def sanitize_age(value):
     """
@@ -32,13 +21,14 @@ def sanitize_age(value):
     the 'age' field instead of a plain integer. Only accept something
     that's actually a plausible human age; everything else becomes None
     rather than polluting the data with junk like "January 02, 1987".
+    Always returns a real Python int (never a float/str), or None.
     """
 
     if value is None:
         return None
 
     try:
-        age_int = int(str(value).strip())
+        age_int = int(float(str(value).strip()))
 
         if 15 <= age_int <= 80:
             return age_int
@@ -49,25 +39,16 @@ def sanitize_age(value):
     return None
 
 
-def sanitize_number(value):
-    """Coerce salary-like fields to a plain number, or None if unusable."""
+def sanitize_experience(value):
+    """Coerce experience_years to a real int (not float/str), or None."""
 
     if value is None:
         return None
 
-    if isinstance(value, (int, float)):
-        return value
-
-    # Strip common junk like "₹", commas, "LPA", "per month" etc.
-    cleaned = re.sub(r"[^\d.]", "", str(value))
-
-    if not cleaned:
-        return None
-
     try:
-        return float(cleaned) if "." in cleaned else int(cleaned)
+        return int(float(str(value).strip()))
 
-    except ValueError:
+    except (ValueError, TypeError):
         return None
 
 
@@ -101,8 +82,6 @@ def sanitize_phone(value):
 
     digits = re.sub(r"\D", "", str(value))
 
-    # Strip a leading country code (91) if present, so we're always
-    # left with just the 10-digit number before re-adding +91.
     if len(digits) == 12 and digits.startswith("91"):
         digits = digits[2:]
 
@@ -117,11 +96,10 @@ def sanitize_phone(value):
 
 def flatten_value(item):
     """
-    The LLM is inconsistent about whether education_history/college
-    entries are plain strings or nested objects with arbitrary keys.
-    This forces everything into a single readable string so every
-    record in the cache/Excel has the same shape, instead of some rows
-    being strings and others being raw JSON dumps.
+    The LLM is inconsistent about whether education_history/college/
+    previous_institutions entries are plain strings or nested objects
+    with arbitrary keys. This forces everything into a single readable
+    string so every record in the cache/Excel has the same shape.
     """
 
     if isinstance(item, str):
@@ -165,9 +143,6 @@ def read_pdf(file, char_limit=5000):
             if page_text:
                 text += page_text + "\n"
 
-            # extract_resume_data only ever uses the first 5000 chars,
-            # so stop parsing further pages once we have enough —
-            # this avoids wasting time on long multi-page resumes.
             if len(text) >= char_limit:
                 break
 
@@ -220,7 +195,7 @@ def extract_experience(text):
                 for x in matches
             )
 
-        except:
+        except Exception:
             pass
 
     return None
@@ -231,23 +206,9 @@ def extract_qualifications(text):
     qualifications = []
 
     keywords = [
-        "B.Ed",
-        "M.Ed",
-        "D.El.Ed",
-        "CTET",
-        "TET",
-        "NET",
-        "UGC NET",
-        "JRF",
-        "PhD",
-        "B.Sc",
-        "M.Sc",
-        "B.A",
-        "M.A",
-        "B.Com",
-        "M.Com",
-        "B.Tech",
-        "M.Tech"
+        "B.Ed", "M.Ed", "D.El.Ed", "CTET", "TET", "NET", "UGC NET",
+        "JRF", "PhD", "B.Sc", "M.Sc", "B.A", "M.A", "B.Com", "M.Com",
+        "B.Tech", "M.Tech"
     ]
 
     lower_text = text.lower()
@@ -257,46 +218,24 @@ def extract_qualifications(text):
         if keyword.lower() in lower_text:
             qualifications.append(keyword)
 
-    return list(set(qualifications))
+    return qualifications
 
-
-# Rough seniority ranking used to pick the TRUE highest qualification out
-# of everything found, instead of picking an arbitrary one from a set
-# (Python sets have no order, which is why "qualification" was previously
-# showing basically a random match instead of the highest one).
-QUALIFICATION_RANK = {
-    "PhD": 100,
-    "JRF": 95,
-    "UGC NET": 90,
-    "NET": 90,
-    "M.Ed": 80,
-    "M.Tech": 75,
-    "M.Sc": 75,
-    "M.A": 75,
-    "M.Com": 75,
-    "B.Ed": 60,
-    "B.Tech": 55,
-    "B.Sc": 55,
-    "B.A": 55,
-    "B.Com": 55,
-    "D.El.Ed": 40,
-    "CTET": 30,
-    "TET": 30,
+_QUALIFICATION_RANK = {
+    "PhD": 9, "UGC NET": 8, "NET": 8, "JRF": 8,
+    "M.Tech": 7, "M.Ed": 7, "M.Sc": 6, "M.A": 6, "M.Com": 6,
+    "B.Tech": 5, "B.Ed": 5, "B.Sc": 4, "B.A": 4, "B.Com": 4,
+    "D.El.Ed": 3, "CTET": 2, "TET": 2,
 }
 
 
 def split_qualifications(qualification_list):
-    """
-    Returns (highest_qualification, extra_qualifications) — the highest
-    by seniority rank, and everything else found (excluding the highest).
-    """
 
     if not qualification_list:
         return None, []
 
     ranked = sorted(
         qualification_list,
-        key=lambda q: QUALIFICATION_RANK.get(q, 0),
+        key=lambda q: _QUALIFICATION_RANK.get(q, 0),
         reverse=True
     )
 
@@ -308,9 +247,37 @@ def split_qualifications(qualification_list):
 
 def extract_resume_data(text):
 
-    # Increased from 5000 to give the model more context — teacher resumes
-    # are often dense, and cutting off early was losing education/subject
-    # details that came later in the document.
+    if os.getenv("MOCK_MODE", "false").lower() == "true":
+        return {
+            "full_name": "Test User",
+            "gender": "Male",
+            "age": 25,
+            "city": "Delhi",
+
+            "subjects": ["Mathematics"],
+            "grade_levels": ["Class 11-12"],
+            "languages": ["English"],
+
+            "college_type": None,
+            "college": ["University of Delhi"],
+            "education_history": ["B.Sc Mathematics, University of Delhi"],
+
+            "current_institution": "ABC School",
+            "current_designation": "PGT Mathematics",
+            "previous_institutions": ["XYZ School"],
+
+            "experience_years": 3,
+            "preferred_job_type": "Full-time",
+
+            "email": "test@example.com",
+            "phone": "+919999999999",
+
+            "qualification": "M.Sc",
+            "extra_qualifications": [],
+
+            "extraction_failed": False
+        }
+
     short_text = text[:8000]
 
     prompt = f"""
@@ -335,6 +302,7 @@ Return ONLY valid JSON, matching this EXACT schema. No explanations, no markdown
 
     "current_institution": null,
     "current_designation": null,
+    "previous_institutions": [],
 
     "experience_years": null,
 
@@ -375,9 +343,17 @@ CRITICAL RULES — follow these exactly:
   total span of relevant experience. If the resume explicitly states a number of years
   of experience, use that instead. If neither can be determined confidently, leave null
   — do NOT guess a number.
+- "current_institution" must be the name of the school/institution the person CURRENTLY
+  works at (their most recent employer), not a college.
 - "current_designation" must be the person's CURRENT or MOST RECENT job title only
   (e.g. "Senior Physics Faculty", "PGT Chemistry Teacher") — not a list, not a summary
   of their whole career, just the one current/latest title.
+- "previous_institutions" must be a list of plain strings — the names of EMPLOYERS
+  (schools/institutions the person has WORKED at, not studied at) prior to their current
+  one, e.g. ["Delhi Public School, Noida", "Ryan International School"]. Do NOT include
+  the current institution in this list, and do NOT include colleges/universities here —
+  those belong in "college". Leave empty if the resume shows no prior employer or only
+  one job overall.
 - "preferred_job_type" — only fill this if the resume EXPLICITLY states a job type
   preference (e.g. "Full-time", "Remote", "Part-time"). If it's not explicitly stated,
   leave it null. Do not infer this from context.
@@ -395,98 +371,86 @@ Resume:
     extraction_failed = False
 
     max_attempts = 4
-    base_delay = 2  # seconds, doubles each retry: 2, 4, 8, 16 (+ jitter)
+    base_delay = 2 
 
-    for model_name in (GROQ_MODEL_PRIMARY, GROQ_MODEL_FALLBACK):
+    for attempt in range(max_attempts):
 
-        got_result = False
+        try:
 
-        for attempt in range(max_attempts):
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0,
+                max_tokens=2000,
+                response_format={"type": "json_object"}
+            )
 
-            try:
+            content = (
+                response.choices[0]
+                .message.content
+                .replace("```json", "")
+                .replace("```", "")
+                .strip()
+            )
 
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ],
-                    temperature=0,
-                    max_tokens=2000,
-                    response_format={"type": "json_object"}
-                )
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
 
-                content = (
-                    response.choices[0]
-                    .message.content
-                    .replace("```json", "")
-                    .replace("```", "")
-                    .strip()
-                )
+            if json_match:
+                content = json_match.group(0)
 
-                # Defensive: even with response_format=json_object, if the
-                # model prefixes any stray text, pull out just the {...}
-                # block rather than failing the whole parse on it.
-                json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            parsed = json.loads(content)
 
-                if json_match:
-                    content = json_match.group(0)
+            if isinstance(parsed, list):
 
-                parsed = json.loads(content)
-
-                if isinstance(parsed, list):
-
-                    if len(parsed) > 0:
-                        parsed = parsed[0]
-                    else:
-                        parsed = {}
-
-                got_result = True
-                break
-
-            except Exception as e:
-
-                err_str = str(e)
-
-                is_rate_limit = "429" in err_str
-                is_parse_error = isinstance(e, json.JSONDecodeError)
-
-                # Retry on rate limits AND on malformed/truncated JSON —
-                # previously a JSON parse failure (the actual common cause
-                # of blank rows) gave up instantly with no retry at all.
-                if (is_rate_limit or is_parse_error) and attempt < max_attempts - 1:
-
-                    # Exponential backoff with jitter instead of a flat 15s.
-                    # Groq free tier often gives a "try again in Xs" hint —
-                    # use it if present, otherwise fall back to backoff.
-                    retry_after = None
-
-                    match = re.search(r"try again in ([\d.]+)s", err_str, re.IGNORECASE)
-
-                    if match:
-                        retry_after = float(match.group(1))
-
-                    delay = retry_after if retry_after else (base_delay * (2 ** attempt))
-                    delay += random.uniform(0, 1)  # jitter to avoid thundering herd
-
-                    time.sleep(delay)
-
-                    continue
-
+                if len(parsed) > 0:
+                    parsed = parsed[0]
                 else:
+                    parsed = {}
 
-                    break
-
-        if got_result:
             break
 
+        except Exception as e:
+
+            print("\n" + "=" * 80)
+            print("OPENAI ERROR")
+            print(type(e))
+            print(str(e))
+            print("=" * 80 + "\n")
+
+            err_str = str(e)
+
+            is_rate_limit = "429" in err_str or "rate_limit" in err_str.lower()
+            is_parse_error = isinstance(e, json.JSONDecodeError)
+
+            if (is_rate_limit or is_parse_error) and attempt < max_attempts - 1:
+
+                retry_after = None
+
+                match = re.search(
+                    r"try again in ([\d.]+)s",
+                    err_str,
+                    re.IGNORECASE
+                )
+
+                if match:
+                    retry_after = float(match.group(1))
+
+                delay = retry_after if retry_after else (base_delay * (2 ** attempt))
+                delay += random.uniform(0, 1)
+
+                time.sleep(delay)
+                continue
+
+            else:
+                extraction_failed = True
+                break
+
     else:
-        # Both models exhausted every retry — this resume's LLM extraction
-        # genuinely failed. Flag it instead of silently returning a blank
-        # record, so it's visible in the final output and you know to
-        # rerun it rather than assume it's just an empty resume.
         extraction_failed = True
 
     qualification_list = extract_qualifications(text)
@@ -496,20 +460,11 @@ Resume:
     parsed["email"] = extract_email(text)
     parsed["phone"] = extract_phone(text)
 
-    # Prefer the LLM's calculated experience (it can reason about date
-    # ranges in the work history). Only fall back to the crude regex
-    # scan if the model couldn't determine it.
-    llm_experience = parsed.get("experience_years")
-
-    try:
-        llm_experience = int(llm_experience) if llm_experience is not None else None
-    except (ValueError, TypeError):
-        llm_experience = None
+    llm_experience = sanitize_experience(parsed.get("experience_years"))
 
     parsed["experience_years"] = llm_experience if llm_experience is not None else extract_experience(text)
 
     parsed["qualification"] = highest_qualification
-
     parsed["extra_qualifications"] = extra_qualification_list
 
     parsed.setdefault("full_name", None)
@@ -528,19 +483,14 @@ Resume:
 
     parsed.setdefault("current_institution", None)
     parsed.setdefault("current_designation", None)
+    parsed.setdefault("previous_institutions", [])
 
     parsed.setdefault("preferred_job_type", None)
 
-    # Normalize whatever the model returned so every cached record has the
-    # same, clean shape — this is what actually fixes garbage values like
-    # a birthdate in "age" or nested dicts in "education_history", instead
-    # of just hiding them at display time.
     parsed["age"] = sanitize_age(parsed.get("age"))
+    parsed["experience_years"] = sanitize_experience(parsed.get("experience_years"))
     parsed["college_type"] = sanitize_college_type(parsed.get("college_type"))
 
-    # Normalize phone to ONE consistent format (+91XXXXXXXXXX) regardless
-    # of whether it came from the regex fallback or however the resume
-    # had it written (with/without +91, spaces, dashes, etc).
     parsed["phone"] = sanitize_phone(parsed.get("phone"))
 
     parsed["college"] = flatten_list_field(parsed.get("college"))
@@ -548,9 +498,8 @@ Resume:
     parsed["subjects"] = flatten_list_field(parsed.get("subjects"))
     parsed["grade_levels"] = flatten_list_field(parsed.get("grade_levels"))
     parsed["languages"] = flatten_list_field(parsed.get("languages"))
+    parsed["previous_institutions"] = flatten_list_field(parsed.get("previous_institutions"))
 
-    # Salary fields are no longer collected — drop them if the model
-    # returned them anyway (e.g. from an older cached prompt behavior).
     parsed.pop("current_salary", None)
     parsed.pop("expected_salary", None)
 

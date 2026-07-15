@@ -1,6 +1,6 @@
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 import io
 import os
@@ -8,15 +8,15 @@ import threading
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-# Google Docs/Sheets/Slides can't be downloaded via get_media() directly
 GOOGLE_NATIVE_MIME_PREFIX = "application/vnd.google-apps"
 
-# googleapiclient's service object (and the httplib2/Http connection under
-# it) is NOT thread-safe. Sharing one instance across threads causes silent
-# corruption or crashes. So each thread gets its OWN service, built once
-# and cached for that thread only.
+SERVICE_ACCOUNT_FILE = os.getenv(
+    "GOOGLE_SERVICE_ACCOUNT_FILE",
+    "symbolic-axe-502107-r1-2ff6db019a1f.json"
+)
+
 _thread_local = threading.local()
 
 
@@ -25,7 +25,7 @@ def get_drive_service():
     if not hasattr(_thread_local, "service"):
 
         creds = service_account.Credentials.from_service_account_file(
-            "symbolic-axe-502107-r1-2ff6db019a1f.json",
+            SERVICE_ACCOUNT_FILE,
             scopes=SCOPES
         )
 
@@ -60,9 +60,6 @@ def get_files_from_folder(folder_url, service=None):
 
     all_files = results.get("files", [])
 
-    # Split out real binary files vs native Google Docs files.
-    # Native Google Docs (mimeType starts with application/vnd.google-apps)
-    # need export(), not get_media(), and are usually not resumes anyway.
     downloadable = [
         f for f in all_files
         if not f.get("mimeType", "").startswith(GOOGLE_NATIVE_MIME_PREFIX)
@@ -78,27 +75,15 @@ def get_files_from_folder(folder_url, service=None):
 
 def download_file(file_id, file_name, output_dir):
 
-    # Each thread fetches its OWN service instance (thread-local, cached).
     service = get_drive_service()
 
-    request = service.files().get_media(
-        fileId=file_id
-    )
+    request = service.files().get_media(fileId=file_id)
 
-    file_path = os.path.join(
-        output_dir,
-        file_name
-    )
+    file_path = os.path.join(output_dir, file_name)
 
-    fh = io.FileIO(
-        file_path,
-        "wb"
-    )
+    fh = io.FileIO(file_path, "wb")
 
-    downloader = MediaIoBaseDownload(
-        fh,
-        request
-    )
+    downloader = MediaIoBaseDownload(fh, request)
 
     done = False
 
@@ -111,14 +96,6 @@ def download_file(file_id, file_name, output_dir):
 
 
 def download_all_files(files, output_dir, max_workers=5, progress_callback=None):
-    """
-    Downloads all files in parallel. Each thread uses its own cached
-    Drive service (thread-local) instead of rebuilding auth per file,
-    and without unsafely sharing one connection across threads.
-
-    Returns (successful_paths, failed_files) where failed_files is a
-    list of dicts: {"name": ..., "error": ...}
-    """
 
     successful = []
     failed = []
@@ -129,10 +106,7 @@ def download_all_files(files, output_dir, max_workers=5, progress_callback=None)
 
         future_to_file = {
             executor.submit(
-                download_file,
-                f["id"],
-                f["name"],
-                output_dir
+                download_file, f["id"], f["name"], output_dir
             ): f
             for f in files
         }
@@ -150,9 +124,77 @@ def download_all_files(files, output_dir, max_workers=5, progress_callback=None)
                 successful.append(path)
 
             except Exception as e:
-                failed.append({
-                    "name": file_info["name"],
-                    "error": str(e)
-                })
+                failed.append({"name": file_info["name"], "error": str(e)})
 
     return successful, failed
+
+def _find_file_in_folder(service, folder_id, file_name):
+
+    results = service.files().list(
+        q=f"'{folder_id}' in parents and name='{file_name}' and trashed=false",
+        fields="files(id,name)"
+    ).execute()
+
+    files = results.get("files", [])
+
+    return files[0]["id"] if files else None
+
+
+def download_cache_from_drive(folder_id, file_name, service=None):
+    """
+    Returns the raw JSON text of file_name from the given Drive folder,
+    or None if it doesn't exist yet (first-ever run).
+    """
+
+    if service is None:
+        service = get_drive_service()
+
+    file_id = _find_file_in_folder(service, folder_id, file_name)
+
+    if file_id is None:
+        return None
+
+    request = service.files().get_media(fileId=file_id)
+
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+
+    return buf.getvalue().decode("utf-8")
+
+
+def upload_cache_to_drive(folder_id, file_name, json_text, service=None):
+    """
+    Creates or updates file_name inside folder_id with json_text content.
+    Update (not create-a-new-copy) if a file with that name already exists,
+    so we don't accumulate duplicate cache files on every run.
+    """
+
+    if service is None:
+        service = get_drive_service()
+
+    media = MediaIoBaseUpload(
+        io.BytesIO(json_text.encode("utf-8")),
+        mimetype="application/json",
+        resumable=False
+    )
+
+    existing_id = _find_file_in_folder(service, folder_id, file_name)
+
+    if existing_id:
+        service.files().update(
+            fileId=existing_id,
+            media_body=media
+        ).execute()
+        return existing_id
+
+    else:
+        created = service.files().create(
+            body={"name": file_name, "parents": [folder_id]},
+            media_body=media,
+            fields="id"
+        ).execute()
+        return created["id"]
