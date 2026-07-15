@@ -79,3 +79,21 @@ def get_existing_hashes():
             hashes.add(str(h))
 
     return hashes
+def get_existing_contacts():
+
+    sheet = get_sheet()
+
+    records = sheet.get_all_records()
+
+    emails = set()
+    phones = set()
+
+    for row in records:
+
+        if row.get("email"):
+            emails.add(str(row["email"]).strip().lower())
+
+        if row.get("phone"):
+            phones.add(str(row["phone"]).strip())
+
+    return emails, phones

@@ -389,7 +389,10 @@ Resume:
                 max_tokens=2000,
                 response_format={"type": "json_object"}
             )
-
+            print("\n" + "=" * 80)
+            print("RAW OPENAI RESPONSE")
+            print(response)
+            print("=" * 80 + "\n")
             content = (
                 response.choices[0]
                 .message.content

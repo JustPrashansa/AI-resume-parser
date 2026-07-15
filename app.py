@@ -1,3 +1,9 @@
+from sheets_utils import (
+    append_candidate,
+    get_existing_hashes,
+    get_existing_contacts
+)
+from sheets_utils import get_sheet
 import streamlit as st
 import pandas as pd
 import os
@@ -11,9 +17,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from drive_utils import (
     get_files_from_folder,
     download_file,
-    download_cache_from_drive,
-    upload_cache_to_drive,
-    get_drive_service
 )
 
 from extractor import (
@@ -71,62 +74,11 @@ drive_link = st.text_input(
 OPENAI_WORKERS = int(get_secret("OPENAI_WORKERS", 5))
 DOWNLOAD_WORKERS = 5
 
-CACHE_FILE = "processed_cache.json"
-CONTENT_CACHE_FILE = "content_hash_cache.json"
-
-content_cache_lock = threading.Lock()
-def load_json_cache(file_name):
-
-    if DRIVE_CACHE_FOLDER_ID:
-        try:
-            text = download_cache_from_drive(DRIVE_CACHE_FOLDER_ID, file_name)
-            if text:
-                return json.loads(text)
-            return {}
-        except Exception as e:
-            st.warning(f"Could not load {file_name} from Drive ({e}). Starting fresh.")
-            return {}
-
-    if not os.path.exists(file_name):
-        return {}
-
-    try:
-        with open(file_name, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_json_cache(file_name, data):
-
-    text = json.dumps(data, ensure_ascii=False, indent=2)
-
-    if DRIVE_CACHE_FOLDER_ID:
-        try:
-            upload_cache_to_drive(DRIVE_CACHE_FOLDER_ID, file_name, text)
-            return
-        except Exception as e:
-            st.error(f"Could not save {file_name} to Drive ({e}). Saving locally instead.")
-
-    with open(file_name, "w", encoding="utf-8") as f:
-        f.write(text)
-
-
-def load_cache():
-    return load_json_cache(CACHE_FILE)
-
-
-def save_cache(cache):
-    save_json_cache(CACHE_FILE, cache)
-
-
 def hash_text(text):
     normalized = " ".join(text.split()).lower()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
-
-def process_resume(file_info, output_dir, content_cache):
-
+def process_resume(file_info, output_dir, existing_hashes):
     file_id = file_info["id"]
     file_name = file_info["name"]
 
@@ -143,28 +95,19 @@ def process_resume(file_info, output_dir, content_cache):
 
         content_hash = hash_text(text)
 
-        with content_cache_lock:
-            cached_result = content_cache.get(content_hash)
-
-        if cached_result is not None:
-
-            data = dict(cached_result)
-            data["resume_link"] = f"https://drive.google.com/file/d/{file_id}/view"
-            data["resume_file_name"] = file_name
-            data["duplicate_of_content"] = True
-
-            return data
+        if content_hash in existing_hashes:
+            return {
+                "duplicate_of_content": True,
+                "resume_file_name": file_name,
+                "content_hash": content_hash
+            }
 
         data = extract_resume_data(text)
-
+        data["content_hash"] = content_hash
+        data["file_id"] = file_id
         data["resume_link"] = f"https://drive.google.com/file/d/{file_id}/view"
         data["resume_file_name"] = file_name
         data["duplicate_of_content"] = False
-
-        if not data.get("extraction_failed"):
-            with content_cache_lock:
-                content_cache[content_hash] = data
-
         return data
 
     except Exception as e:
@@ -202,12 +145,11 @@ if st.button("Process Resumes"):
 
     st.write(f"Found {len(files)} files")
 
-    cache = load_cache()
-    content_cache = load_json_cache(CONTENT_CACHE_FILE)
+    existing_hashes = get_existing_hashes()
+    existing_emails, existing_phones = get_existing_contacts()
 
-    already_processed = [f for f in files if f["id"] in cache]
-    new_files = [f for f in files if f["id"] not in cache]
-
+    already_processed = []
+    new_files = files
     st.info(
         f"{len(already_processed)} already processed before (skipping) — "
         f"{len(new_files)} new files to process now."
@@ -250,9 +192,11 @@ if st.button("Process Resumes"):
 
         try:
             future.result()
-
             process_future = groq_executor.submit(
-                process_resume, file_info, output_dir, content_cache
+                process_resume,
+                file_info,
+                output_dir,
+                existing_hashes
             )
             process_futures[process_future] = file_info
 
@@ -275,23 +219,50 @@ if st.button("Process Resumes"):
             else:
                 results.append(result)
 
-                if not result.get("extraction_failed"):
-                    cache[file_info["id"]] = result
+                if (
+                    not result.get("extraction_failed")
+                    and not result.get("duplicate_of_content")
+                ):
+
+                    email = str(result.get("email", "")).strip().lower()
+                    phone = str(result.get("phone", "")).strip()
+                    st.write(
+                        "CHECKING:",
+                        email,
+                        phone
+                    )
+
+                    if email in existing_emails or phone in existing_phones:
+                        st.warning(
+                            f"Skipping existing candidate: {result.get('full_name')}"
+                        )
+                        continue
+
+                    st.write(
+                        "ADDING:",
+                        result.get("full_name"),
+                        result.get("email"),
+                        result.get("phone")
+                    )
+                    st.write("Writing to Google Sheets:", result.get("full_name"))
+                    append_candidate(result)
+
+                    if result.get("content_hash"):
+                        existing_hashes.add(str(result["content_hash"]))
+
+                    existing_emails.add(email)
+                    existing_phones.add(phone)
 
     download_executor.shutdown(wait=True)
     groq_executor.shutdown(wait=True)
-
-    save_cache(cache)
-    save_json_cache(CONTENT_CACHE_FILE, content_cache)
 
     duplicate_content_count = sum(1 for r in results if r.get("duplicate_of_content"))
 
     failed_extraction = [r for r in results if r.get("extraction_failed")]
 
     st.write(
-        f"Done. {len(results)} new files handled "
-        f"({duplicate_content_count} were duplicate content — skipped the model call, reused cached result). "
-        f"{len(cache)} total candidates in cache."
+        f"Done. {len(results)} files processed "
+        f"({duplicate_content_count} were duplicate content)."
     )
 
     if failed_extraction:
@@ -307,11 +278,14 @@ if st.button("Process Resumes"):
             f"Re-run later to retry them: {failed_names}"
         )
 
-    all_results = list(cache.values())
+    unique_results = [
+        r for r in results
+        if not r.get("duplicate_of_content")
+    ]
 
-    if all_results:
+    if unique_results:
 
-        df = pd.DataFrame(all_results)
+        df = pd.DataFrame(unique_results)
 
         list_columns = [
             "subjects",
@@ -387,9 +361,7 @@ if st.button("Process Resumes"):
         excel_file = "candidates.xlsx"
 
         df.to_excel(excel_file, index=False)
-
         st.success(f"Processed {len(df)} unique candidates")
-
         st.dataframe(df, width="stretch")
 
         with open(excel_file, "rb") as f:
@@ -402,4 +374,9 @@ if st.button("Process Resumes"):
             )
 
     else:
-        st.warning("No candidate data extracted.")
+        if duplicate_content_count > 0:
+            st.success(
+                f"All {duplicate_content_count} resumes were already processed before."
+            )
+        else:
+            st.warning("No candidate data extracted.")
