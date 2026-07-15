@@ -1,5 +1,5 @@
 .env
-*.json
+symbolic-axe-502107-r1-2ff6db019a1f.json
 __pycache__/
 *.pyc
 temp_resumes/
