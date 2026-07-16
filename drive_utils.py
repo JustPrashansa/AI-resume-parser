@@ -5,6 +5,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 import io
 import os
 import threading
+import streamlit as st
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -12,22 +13,41 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 GOOGLE_NATIVE_MIME_PREFIX = "application/vnd.google-apps"
 
-SERVICE_ACCOUNT_FILE = os.getenv(
-    "GOOGLE_SERVICE_ACCOUNT_FILE",
-    "symbolic-axe-502107-r1-2ff6db019a1f.json"
-)
-
 _thread_local = threading.local()
+
+
+def _get_credentials():
+    """
+    Works both locally (a JSON key file on disk) and on Streamlit
+    Community Cloud (the JSON content pasted into Secrets — no file
+    needed). Streamlit secrets take priority when present.
+    """
+
+    try:
+        if "gcp_service_account" in st.secrets:
+            return service_account.Credentials.from_service_account_info(
+                dict(st.secrets["gcp_service_account"]),
+                scopes=SCOPES
+            )
+    except Exception:
+        pass
+
+    service_account_file = os.getenv(
+        "GOOGLE_SERVICE_ACCOUNT_FILE",
+        "symbolic-axe-502107-r1-2ff6db019a1f.json"
+    )
+
+    return service_account.Credentials.from_service_account_file(
+        service_account_file,
+        scopes=SCOPES
+    )
 
 
 def get_drive_service():
 
     if not hasattr(_thread_local, "service"):
 
-        creds = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE,
-            scopes=SCOPES
-        )
+        creds = _get_credentials()
 
         _thread_local.service = build(
             "drive",

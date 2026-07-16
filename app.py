@@ -49,7 +49,6 @@ def get_secret(name, default=None):
 
 
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
-DRIVE_CACHE_FOLDER_ID = get_secret("DRIVE_CACHE_FOLDER_ID")
 
 if not OPENAI_API_KEY:
     st.error(
@@ -58,14 +57,6 @@ if not OPENAI_API_KEY:
     )
     st.stop()
 os.environ.setdefault("OPENAI_API_KEY", OPENAI_API_KEY)
-
-if not DRIVE_CACHE_FOLDER_ID:
-    st.warning(
-        "DRIVE_CACHE_FOLDER_ID is not set — caches will only be saved "
-        "locally on this machine for this session, not persisted to "
-        "Google Drive. Set DRIVE_CACHE_FOLDER_ID to a Drive folder ID "
-        "(shared with your service account) to persist across machines."
-    )
 
 drive_link = st.text_input(
     "Paste Google Drive Folder Link"
@@ -148,17 +139,11 @@ if st.button("Process Resumes"):
     existing_hashes = get_existing_hashes()
     existing_emails, existing_phones = get_existing_contacts()
 
-    already_processed = []
-    new_files = files
     st.info(
-        f"{len(already_processed)} already processed before (skipping) — "
-        f"{len(new_files)} new files to process now."
+        f"{len(existing_hashes)} resumes already in the master sheet by content — "
+        f"{len(files)} files in this folder will be checked against them now "
+        f"(downloads happen regardless; duplicates are skipped before any OpenAI call)."
     )
-
-    if not new_files:
-        st.success("Nothing new to process. Using cached results only.")
-
-    files = new_files
 
     download_progress = st.progress(0)
     process_progress = st.progress(0)
@@ -217,7 +202,6 @@ if st.button("Process Resumes"):
             if "error" in result:
                 st.error(result["error"])
             else:
-                results.append(result)
 
                 if (
                     not result.get("extraction_failed")
@@ -226,43 +210,47 @@ if st.button("Process Resumes"):
 
                     email = str(result.get("email", "")).strip().lower()
                     phone = str(result.get("phone", "")).strip()
-                    st.write(
-                        "CHECKING:",
-                        email,
-                        phone
-                    )
 
-                    if email in existing_emails or phone in existing_phones:
+                    if (email and email in existing_emails) or (phone and phone in existing_phones):
+
                         st.warning(
                             f"Skipping existing candidate: {result.get('full_name')}"
                         )
+                        result["skipped_existing_contact"] = True
+                        results.append(result)
                         continue
 
-                    st.write(
-                        "ADDING:",
-                        result.get("full_name"),
-                        result.get("email"),
-                        result.get("phone")
-                    )
-                    st.write("Writing to Google Sheets:", result.get("full_name"))
                     append_candidate(result)
 
                     if result.get("content_hash"):
                         existing_hashes.add(str(result["content_hash"]))
 
-                    existing_emails.add(email)
-                    existing_phones.add(phone)
+                    if email:
+                        existing_emails.add(email)
+                    if phone:
+                        existing_phones.add(phone)
+
+                results.append(result)
 
     download_executor.shutdown(wait=True)
     groq_executor.shutdown(wait=True)
 
     duplicate_content_count = sum(1 for r in results if r.get("duplicate_of_content"))
+    skipped_existing_count = sum(1 for r in results if r.get("skipped_existing_contact"))
 
     failed_extraction = [r for r in results if r.get("extraction_failed")]
 
+    unique_results = [
+        r for r in results
+        if not r.get("duplicate_of_content")
+        and not r.get("skipped_existing_contact")
+    ]
+
     st.write(
         f"Done. {len(results)} files processed "
-        f"({duplicate_content_count} were duplicate content)."
+        f"({duplicate_content_count} were duplicate content, "
+        f"{skipped_existing_count} matched an existing candidate by email/phone). "
+        f"{len(unique_results)} new candidates added to the sheet this run."
     )
 
     if failed_extraction:
@@ -277,11 +265,6 @@ if st.button("Process Resumes"):
             f"for these, everything else is blank). "
             f"Re-run later to retry them: {failed_names}"
         )
-
-    unique_results = [
-        r for r in results
-        if not r.get("duplicate_of_content")
-    ]
 
     if unique_results:
 

@@ -131,7 +131,7 @@ def flatten_list_field(value):
     return [item for item in result if item]
 
 
-def read_pdf(file, char_limit=5000):
+def read_pdf(file, char_limit=8000):
     text = ""
 
     with pdfplumber.open(file) as pdf:
@@ -389,10 +389,6 @@ Resume:
                 max_tokens=2000,
                 response_format={"type": "json_object"}
             )
-            print("\n" + "=" * 80)
-            print("RAW OPENAI RESPONSE")
-            print(response)
-            print("=" * 80 + "\n")
             content = (
                 response.choices[0]
                 .message.content
@@ -419,11 +415,7 @@ Resume:
 
         except Exception as e:
 
-            print("\n" + "=" * 80)
-            print("OPENAI ERROR")
-            print(type(e))
-            print(str(e))
-            print("=" * 80 + "\n")
+            print(f"[OpenAI] Error on attempt: {type(e).__name__}: {e}")
 
             err_str = str(e)
 

@@ -1,5 +1,6 @@
 import os
 import gspread
+import streamlit as st
 
 from google.oauth2 import service_account
 
@@ -8,24 +9,50 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-SERVICE_ACCOUNT_FILE = os.getenv(
-    "GOOGLE_SERVICE_ACCOUNT_FILE",
-    "symbolic-axe-502107-r1-2ff6db019a1f.json"
-)
-
 SHEET_NAME = "Resume_Master_DB"
 
 
-def get_sheet():
+def _get_credentials():
+    """
+    Works both locally (a JSON key file on disk) and on Streamlit
+    Community Cloud (the JSON content pasted into Secrets — no file
+    needed). Streamlit secrets take priority when present.
+    """
 
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
+    try:
+        if "gcp_service_account" in st.secrets:
+            return service_account.Credentials.from_service_account_info(
+                dict(st.secrets["gcp_service_account"]),
+                scopes=SCOPES
+            )
+    except Exception:
+        pass
+
+    service_account_file = os.getenv(
+        "GOOGLE_SERVICE_ACCOUNT_FILE",
+        "symbolic-axe-502107-r1-2ff6db019a1f.json"
+    )
+
+    return service_account.Credentials.from_service_account_file(
+        service_account_file,
         scopes=SCOPES
     )
+
+_sheet_cache = {"sheet": None}
+
+
+def get_sheet(force_refresh=False):
+
+    if _sheet_cache["sheet"] is not None and not force_refresh:
+        return _sheet_cache["sheet"]
+
+    creds = _get_credentials()
 
     client = gspread.authorize(creds)
 
     sheet = client.open(SHEET_NAME).sheet1
+
+    _sheet_cache["sheet"] = sheet
 
     return sheet
 
@@ -44,18 +71,18 @@ def append_candidate(candidate):
         candidate.get("gender"),
         candidate.get("age"),
         candidate.get("city"),
-        ", ".join(candidate.get("subjects", [])),
-        ", ".join(candidate.get("grade_levels", [])),
-        ", ".join(candidate.get("languages", [])),
+        ", ".join(candidate.get("subjects") or []),
+        ", ".join(candidate.get("grade_levels") or []),
+        ", ".join(candidate.get("languages") or []),
         candidate.get("qualification"),
-        ", ".join(candidate.get("extra_qualifications", [])),
+        ", ".join(candidate.get("extra_qualifications") or []),
         candidate.get("college_type"),
-        ", ".join(candidate.get("college", [])),
-        ", ".join(candidate.get("education_history", [])),
+        ", ".join(candidate.get("college") or []),
+        ", ".join(candidate.get("education_history") or []),
         candidate.get("experience_years"),
         candidate.get("current_institution"),
         candidate.get("current_designation"),
-        ", ".join(candidate.get("previous_institutions", [])),
+        ", ".join(candidate.get("previous_institutions") or []),
         candidate.get("preferred_job_type"),
         candidate.get("resume_link")
     ]
@@ -79,6 +106,8 @@ def get_existing_hashes():
             hashes.add(str(h))
 
     return hashes
+
+
 def get_existing_contacts():
 
     sheet = get_sheet()
