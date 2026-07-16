@@ -63,7 +63,7 @@ drive_link = st.text_input(
     "Paste Google Drive Folder Link"
 )
 
-OPENAI_WORKERS = int(get_secret("OPENAI_WORKERS", 5))
+OPENAI_WORKERS = int(get_secret("OPENAI_WORKERS", 2))
 DOWNLOAD_WORKERS = 5
 
 def hash_text(text):
@@ -222,6 +222,9 @@ if st.button("Process Resumes"):
                         results.append(result)
                         continue
 
+                    import time
+
+                    time.sleep(1)
                     append_candidate(result)
                     result["written_to_sheet"] = True
 
