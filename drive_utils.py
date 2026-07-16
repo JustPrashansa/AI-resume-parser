@@ -73,13 +73,24 @@ def get_files_from_folder(folder_url, service=None):
 
     folder_id = extract_folder_id(folder_url)
 
-    results = service.files().list(
-        q=f"'{folder_id}' in parents and trashed=false",
-        fields="files(id,name,mimeType)"
-    ).execute()
+    all_files = []
+    page_token = None
 
-    all_files = results.get("files", [])
+    while True:
 
+        results = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="nextPageToken, files(id,name,mimeType)",
+            pageSize=1000,
+            pageToken=page_token
+        ).execute()
+
+        all_files.extend(results.get("files", []))
+
+        page_token = results.get("nextPageToken")
+
+        if not page_token:
+            break
     downloadable = [
         f for f in all_files
         if not f.get("mimeType", "").startswith(GOOGLE_NATIVE_MIME_PREFIX)
