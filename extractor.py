@@ -181,10 +181,30 @@ def extract_phone(text):
 
 def extract_experience(text):
 
-    matches = re.findall(
-        r'(\d+)\+?\s*years',
-        text,
-        re.IGNORECASE
+    matches = []
+
+    matches.extend(
+        re.findall(
+            r'(\d+)\+?\s*years',
+            text,
+            re.IGNORECASE
+        )
+    )
+
+    matches.extend(
+        re.findall(
+            r'(\d+)\+?\s*yrs',
+            text,
+            re.IGNORECASE
+        )
+    )
+
+    matches.extend(
+        re.findall(
+            r'total\s*yrs?.*?(\d+)',
+            text,
+            re.IGNORECASE
+        )
     )
 
     if matches:
@@ -206,9 +226,40 @@ def extract_qualifications(text):
     qualifications = []
 
     keywords = [
-        "B.Ed", "M.Ed", "D.El.Ed", "CTET", "TET", "NET", "UGC NET",
-        "JRF", "PhD", "B.Sc", "M.Sc", "B.A", "M.A", "B.Com", "M.Com",
-        "B.Tech", "M.Tech"
+        "PhD",
+        "Ph.D",
+        "Ph. D",
+        "Doctor of Philosophy",
+        "UGC NET",
+        "NET",
+        "CSIR-NET",
+        "GATE",
+        "JRF",
+
+        "MBA",
+        "PGDM",
+        "M.Tech",
+        "M.Ed",
+        "M.Sc",
+        "M.A",
+        "M.Com",
+        "MCA",
+        "MBM",
+
+        "B.Tech",
+        "B.Ed",
+        "B.Sc",
+        "B.A",
+        "B.Com",
+        "BCA",
+        "BBA",
+
+        "D.El.Ed",
+        "D.T.Ed",
+        "DSM",
+
+        "CTET",
+        "TET"
     ]
 
     lower_text = text.lower()
@@ -221,10 +272,42 @@ def extract_qualifications(text):
     return qualifications
 
 _QUALIFICATION_RANK = {
-    "PhD": 9, "UGC NET": 8, "NET": 8, "JRF": 8,
-    "M.Tech": 7, "M.Ed": 7, "M.Sc": 6, "M.A": 6, "M.Com": 6,
-    "B.Tech": 5, "B.Ed": 5, "B.Sc": 4, "B.A": 4, "B.Com": 4,
-    "D.El.Ed": 3, "CTET": 2, "TET": 2,
+    "PhD": 100,
+    "Ph.D": 100,
+    "Ph. D": 100,
+    "Doctor of Philosophy": 100,
+    "UGC NET": 95,
+    "CSIR-NET": 95,
+    "NET": 95,
+    "JRF": 95,
+
+    "GATE": 90,
+
+    "MBA": 85,
+    "PGDM": 85,
+    "M.Tech": 85,
+    "MCA": 85,
+
+    "MBM": 80,
+    "M.Ed": 80,
+    "M.Sc": 80,
+    "M.A": 80,
+    "M.Com": 80,
+
+    "B.Tech": 70,
+    "B.Ed": 70,
+    "B.Sc": 70,
+    "B.A": 70,
+    "B.Com": 70,
+    "BCA": 70,
+    "BBA": 70,
+
+    "D.El.Ed": 60,
+    "D.T.Ed": 60,
+    "DSM": 50,
+
+    "CTET": 40,
+    "TET": 40
 }
 
 
@@ -240,7 +323,7 @@ def split_qualifications(qualification_list):
     )
 
     highest = ranked[0]
-    extras = ranked[1:]
+    extras = [q for q in ranked[1:] if q != highest]
 
     return highest, extras
 
@@ -279,6 +362,16 @@ def extract_resume_data(text):
         }
 
     short_text = text[:8000]
+    lower_text = text.lower()
+
+    if (
+        "offer letter" in lower_text
+        or "appointment as" in lower_text
+    ):
+        return {
+            "extraction_failed": True,
+            "error": "Document appears to be an offer letter, not a resume"
+        }
 
     prompt = f"""
 You are an expert teacher resume parser. Extract structured data from the resume text below.
@@ -290,30 +383,29 @@ Return ONLY valid JSON, matching this EXACT schema. No explanations, no markdown
     "gender": null,
     "age": null,
     "city": null,
-
     "subjects": [],
     "grade_levels": [],
     "languages": [],
-
+    "skills": [],
     "college_type": null,
-
     "college": [],
     "education_history": [],
-
     "current_institution": null,
     "current_designation": null,
     "previous_institutions": [],
-
     "experience_years": null,
-
-    "preferred_job_type": null
 }}
 
 CRITICAL RULES — follow these exactly:
 
 - "age" must be a plain integer (e.g. 28), representing the person's current age in years.
   NEVER put a date of birth, a year, or any text in "age". If the resume doesn't state an
-  actual age (a number of years), leave "age" as null. Do NOT calculate age from a birth date.
+  actual age (a number of years), leave "age" as null. If DOB or birth year is present,
+calculate current age in years. Return a plain integer age.
+Examples:
+02-09-2002 -> 23
+23/02/1974 -> 52
+If no DOB or age information exists, return null.
 - "gender" — if not explicitly stated in the resume, INFER it from the person's first name
   using common Indian naming conventions (e.g. "Priya" -> Female, "Rajesh" -> Male). Return
   "Male" or "Female". Only leave this null if the name is genuinely ambiguous or unavailable
@@ -323,10 +415,126 @@ CRITICAL RULES — follow these exactly:
   Technology. Set it to "NIT" only if they studied at any National Institute of Technology.
   If neither applies, leave it null — do NOT put any other institution name, degree type,
   or descriptive text in this field.
-- "college" must be a list of INSTITUTION/UNIVERSITY NAMES ONLY — plain strings like
+- skills must be a list of technical or professional skills.
+    Examples:
+    ["MS-CIT", "Tally Prime", "C++", "R", "LaTeX"]
+- college must contain ONLY the institutions
+associated with the candidate's highest
+educational qualifications.
+Maximum 3 institutions.
+Do NOT include:
+- SSC schools
+- HSC schools
+- coaching centres
+- certification institutes
+- every institution from education history
+Examples:
+GOOD:
+["IIT Delhi"]
+GOOD:
+["Yashwantrao Chavan University",
+ "North Maharashtra University"]
+BAD:
+["School",
+ "College",
+ "SSC Board",
+ "Coaching Centre",
+ "University",
+ "Training Institute"] — plain strings like
   "Indian Institute of Technology, Bombay" or "University of Delhi". Do NOT put degree
   names, years, or percentages in this field (e.g. "B.Sc (2021)" is WRONG — that belongs
   in education_history, not here).
+- city must be a single city/town name only.
+
+- Do NOT guess, infer, correct, or construct city names.
+- current_designation should be the person's most recent
+  job title/designation.
+
+- Common examples:
+  Faculty
+  Biology Faculty
+  Mathematics Faculty
+  Physics Faculty
+  Chemistry Faculty
+  Teacher
+  Lecturer
+  Professor
+  Assistant Professor
+  Principal
+  Coordinator
+  Trainer
+
+- If the resume mentions "Faculty",
+  "Teaching Assistant",
+  "Professor",
+  "Lecturer",
+  etc., do not leave current_designation blank.
+
+- Return null only when no designation can be identified.
+- Do NOT return locality names, colony names,
+  streets, areas, villages, districts,
+  addresses, landmarks, or combinations of locations.
+
+- If multiple locations are present,
+  return only the actual city/town name.
+
+Examples:
+
+GOOD:
+"Mumbai"
+"Dhule"
+"Buldana"
+"Ichalkaranji"
+"Delhi"
+
+BAD:
+"Shivaji Nagar Korochi"
+"Sector 62 Noida"
+"Near Bus Stand"
+"Taluka Hatkanangale"
+"Korochi, Kolhapur"
+"Village XYZ"
+
+- If a clear city/town name cannot be determined,
+  return null.
+- education_history should include only graduation,
+  post-graduation, diploma, doctorate,
+  professional qualifications, certifications,
+  and higher education.
+- previous_institutions must contain only places
+  where the candidate WORKED.
+- If an institution appears in education_history,
+  it should NOT appear in previous_institutions
+  unless the resume explicitly states that the
+  candidate worked there.
+- Do NOT include:
+  colleges
+  universities
+  schools attended as a student
+  training institutes
+  certification institutes
+
+- Include only organizations where the candidate
+  was employed, taught, trained students,
+  or held a professional role.
+
+Examples:
+
+GOOD:
+Delhi Public School
+Aakash Institute
+FIITJEE
+Allen Career Institute
+
+BAD:
+IIT Delhi
+University of Delhi
+North Maharashtra University
+Jai Hind College
+Canossa Convent High School
+- Exclude SSC, HSC, Class 10,
+  Class 12, Secondary Education,
+  Higher Secondary Education entries.
 - "education_history" must be a list of plain strings, one per degree/qualification,
   each combining degree + institution + year into ONE readable string, e.g.
   "M.Sc. Chemistry, XYZ University, 2020, 75%". Do not return nested objects.
@@ -354,9 +562,6 @@ CRITICAL RULES — follow these exactly:
   the current institution in this list, and do NOT include colleges/universities here —
   those belong in "college". Leave empty if the resume shows no prior employer or only
   one job overall.
-- "preferred_job_type" — only fill this if the resume EXPLICITLY states a job type
-  preference (e.g. "Full-time", "Remote", "Part-time"). If it's not explicitly stated,
-  leave it null. Do not infer this from context.
 - Do not guess or hallucinate any value except gender as instructed above.
   If something else isn't clearly stated, use null (or an empty list for list fields).
 - languages must be a list of plain strings.
@@ -470,6 +675,7 @@ Resume:
     parsed.setdefault("subjects", [])
     parsed.setdefault("grade_levels", [])
     parsed.setdefault("languages", [])
+    parsed.setdefault("skills", [])
 
     parsed.setdefault("college_type", None)
 
@@ -479,9 +685,6 @@ Resume:
     parsed.setdefault("current_institution", None)
     parsed.setdefault("current_designation", None)
     parsed.setdefault("previous_institutions", [])
-
-    parsed.setdefault("preferred_job_type", None)
-
     parsed["age"] = sanitize_age(parsed.get("age"))
     parsed["experience_years"] = sanitize_experience(parsed.get("experience_years"))
     parsed["college_type"] = sanitize_college_type(parsed.get("college_type"))
@@ -493,6 +696,7 @@ Resume:
     parsed["subjects"] = flatten_list_field(parsed.get("subjects"))
     parsed["grade_levels"] = flatten_list_field(parsed.get("grade_levels"))
     parsed["languages"] = flatten_list_field(parsed.get("languages"))
+    parsed["skills"] = flatten_list_field(parsed.get("skills"))
     parsed["previous_institutions"] = flatten_list_field(parsed.get("previous_institutions"))
 
     parsed.pop("current_salary", None)

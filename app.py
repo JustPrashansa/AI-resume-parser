@@ -276,6 +276,7 @@ if st.button("Process Resumes"):
             "subjects",
             "grade_levels",
             "languages",
+            "skills",
             "extra_qualifications",
             "college",
             "education_history",
@@ -333,9 +334,7 @@ if st.button("Process Resumes"):
             "current_institution",
             "current_designation",
             "previous_institutions",
-
-            "preferred_job_type",
-
+            "skills",
             "resume_link"
         ]
 

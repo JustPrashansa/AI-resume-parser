@@ -83,7 +83,7 @@ def append_candidate(candidate):
         candidate.get("current_institution"),
         candidate.get("current_designation"),
         ", ".join(candidate.get("previous_institutions") or []),
-        candidate.get("preferred_job_type"),
+        ", ".join(candidate.get("skills") or []),
         candidate.get("resume_link")
     ]
 
