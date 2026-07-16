@@ -13,8 +13,7 @@ load_dotenv()
 client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
-st.write("KEY PREFIX:", OPENAI_API_KEY[:20])
-st.write("KEY SUFFIX:", OPENAI_API_KEY[-6:])
+
 OPENAI_MODEL = "gpt-4.1-mini"
 
 def sanitize_age(value):

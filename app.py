@@ -50,6 +50,7 @@ def get_secret(name, default=None):
 
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 
+
 if not OPENAI_API_KEY:
     st.error(
         "OPENAI_API_KEY is not set. Add it to your .env file locally, or "
