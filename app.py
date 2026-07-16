@@ -216,11 +216,13 @@ if st.button("Process Resumes"):
                         st.warning(
                             f"Skipping existing candidate: {result.get('full_name')}"
                         )
+
                         result["skipped_existing_contact"] = True
                         results.append(result)
                         continue
 
                     append_candidate(result)
+                    result["written_to_sheet"] = True
 
                     if result.get("content_hash"):
                         existing_hashes.add(str(result["content_hash"]))
@@ -242,15 +244,15 @@ if st.button("Process Resumes"):
 
     unique_results = [
         r for r in results
-        if not r.get("duplicate_of_content")
-        and not r.get("skipped_existing_contact")
+        if r.get("written_to_sheet")
     ]
 
     st.write(
         f"Done. {len(results)} files processed "
-        f"({duplicate_content_count} were duplicate content, "
-        f"{skipped_existing_count} matched an existing candidate by email/phone). "
-        f"{len(unique_results)} new candidates added to the sheet this run."
+        f"({duplicate_content_count} duplicate content, "
+        f"{skipped_existing_count} matched an existing candidate, "
+        f"{len(failed_extraction)} failed extraction and were NOT written to the sheet). "
+        f"{len(unique_results)} new candidates actually added to the sheet this run."
     )
 
     if failed_extraction:
